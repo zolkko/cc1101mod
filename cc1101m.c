@@ -78,80 +78,141 @@ static struct spi_driver cc1101_driver = {
 };
 
 
-static irqreturn_t gdo0_interrupt_handler(int i, void * data)
+struct cc1101_data {
+    struct spi_device * spi;
+
+    int gdo0_pin;
+    int gdo2_pin;
+
+    int gdo0_irq;
+    int gdo2_irq;
+
+    int gdo0_val;
+    int gdo2_val;
+};
+
+
+static irqreturn_t gdo0_interrupt_handler(int i, void * irq_data)
 {
-    int value = gpio_get_value(GDO0_pin);
-    printk(KERN_INFO "GDO0 interrupt handler %d %d, value = %d\n", i, (int) data, value);
-    return IRQ_HANDLED; // IRQ_NONE;
+    struct cc1101_data * data = (struct cc1101_data *)irq_data;
+    int value = gpio_get_value(data->gdo0_pin);
+
+    if (value != data->gdo0_val) {
+        data->gdo0_val = value;
+        printk(KERN_INFO "CC1101 GDO0 interrupt handler value: %d\n", value);
+        return IRQ_HANDLED;
+    } else {
+        return IRQ_NONE;
+    }
 }
 
 
-static irqreturn_t gdo2_interrupt_handler(int i, void * data)
+static irqreturn_t gdo2_interrupt_handler(int i, void * irq_data)
 {
-    int value = gpio_get_value(GDO2_pin);
-    printk(KERN_INFO "GDO2 interrupt handler %d %d, value = %d\n", i, (int) data, value);
-    return IRQ_HANDLED; // IRQ_NONE;
+    struct cc1101_data * data = (struct cc1101_data *)irq_data;
+    int value = gpio_get_value(data->gdo2_pin);
+
+    if (value != data->gdo2_val) {
+        data->gdo2_val = value;
+        printk(KERN_INFO "CC1101 GDO2 interrupt handler value: %d\n", value);
+        return IRQ_HANDLED;
+    } else {
+        return IRQ_NONE;
+    }
 }
 
 
 int cc1101_probe(struct spi_device * spi)
 {
+    int result;
+
+    result = 0;
+
 	printk(KERN_INFO "CC1101 driver probe\n");
     
     // setup GDO0
     if (!gpio_is_valid(GDO0_pin)) {
         printk(KERN_ERR "CC1101 GDO0 pin %d is invalid\n", GDO0_pin);
+        result = -EINVAL;
         goto cc1101_probe_fail;
     }
 
     gdo0_res = gpio_request_one(GDO0_pin, GPIOF_DIR_IN, GDO0_name);
     if (gdo0_res != 0) {
         printk(KERN_ERR "CC1101 could not acquire GDO0. Reason: %d\n", gdo0_res);
+        result = -EBUSY;
         goto cc1101_probe_fail;
     }
     
     gdo0_irq_num = gpio_to_irq(GDO0_pin);
     if (gdo0_irq_num < 0) {
         printk(KERN_ERR "CC1101 driver cannot allocate IRQ for GDO0. Reason: %d\n", gdo0_irq_num);
+        result = -EINVAL;
         goto cc1101_probe_free_gdo0;
     }
 
     gdo0_irq = request_irq(gdo0_irq_num, gdo0_interrupt_handler, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, GDO0_IRQ_NAME, spi);
     if (gdo0_irq != 0) {
         printk(KERN_ERR "CC1101 GDO0 failed to request irq. Reason: %d\n", gdo0_irq);
+        result = -EBUSY;
         goto cc1101_probe_free_gdo0;
     }
 
     // setup GDO2
     if (!gpio_is_valid(GDO2_pin)) {
         printk(KERN_ERR "CC1101 GDO2 pin %d is invalid\n", GDO2_pin);
+        result = -EINVAL;
         goto cc1101_probe_free_gdo0_irq;
     }
 
     gdo2_res = gpio_request_one(GDO2_pin, GPIOF_DIR_IN, GDO2_name);
     if (gdo2_res != 0) {
         printk(KERN_ERR "CC1101 could not acquire GDO2. Reason: %d\n", gdo2_res);
+        result = -EBUSY;
         goto cc1101_probe_free_gdo0_irq;
     }
 
     gdo2_irq_num = gpio_to_irq(GDO2_pin);
     if (gdo2_irq_num < 0) {
         printk(KERN_ERR "CC1101 driver cannot allocate IRQ for GDO2. Reason: %d\n", gdo2_irq_num);
+        result = -EINVAL;
         goto cc1101_probe_free_gdo2;
     }
 
     gdo2_irq = request_irq(gdo2_irq_num, gdo2_interrupt_handler, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, GDO2_IRQ_NAME, spi);
     if (gdo2_irq != 0) {
         printk(KERN_ERR "CC1101 GDO2 failed to request irq. Reason: %d\n", gdo2_irq);
+        result = -EBUSY;
         goto cc1101_probe_free_gdo0;
     }
 
-    // TODO: initialize CC1101 IC using SPI interface
+    // initialize spi_data struct
+
+    struct cc1101_data * spi_data;
+    spi_data = kzalloc(sizeof(*spi_data), GFP_KERNEL);
+    if (!spi_data) {
+        printk(KERN_ERR "CC1101M module cannot allocate memory\n");
+        result = -ENOMEM;
+        goto cc1101_probe_free_gdo2_irq;
+    }
+
+    spi_data->spi = spi;
+
+    spi_data->gdo0_pin = GDO0_pin;
+    spi_data->gdo2_pin = GDO2_pin;
+
+    spi_data->gdo0_irq = gdo0_irq_num;
+    spi_data->gdo2_irq = gdo2_irq_num;
+
+    spi_data->gdo0_val = gpio_get_value(GDO0_pin);
+    spi_data->gdo2_val = gpio_get_value(GDO2_pin);
+
+    spi_set_drvdata(spi, spi_data);
 
     return 0;
 
-//cc1101_probe_free_gdo2_irq:
-//    free_irq(gdo2_irq_num, spi);
+cc1101_probe_free_gdo2_irq:
+    free_irq(gdo2_irq_num, spi);
 
 cc1101_probe_free_gdo2:
     gpio_free(GDO2_pin);
@@ -169,13 +230,24 @@ cc1101_probe_fail:
 
 int cc1101_remove(struct spi_device * spi)
 {
+    struct cc1101_data  * data;
+
 	printk(KERN_INFO "CC1101 module de-initialization\n");
 
-    free_irq(gdo0_irq_num, spi);
-    free_irq(gdo2_irq_num, spi);
+    // TODO: i need to make sure that all transfer operations have finished before free the structure
 
-    gpio_free(GDO0_pin);
-    gpio_free(GDO2_pin);
+    data = spi_get_drvdata(spi);
+
+    data->spi = NULL;
+    spi_set_drvdata(spi, NULL);
+
+    free_irq(data->gdo0_irq, spi);
+    free_irq(data->gdo2_irq, spi);
+
+    gpio_free(data->gdo0_pin);
+    gpio_free(data->gdo2_pin);
+
+    kfree(data);
 
     return 0;
 }
