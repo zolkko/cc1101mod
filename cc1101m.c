@@ -91,7 +91,12 @@ struct cc1101_data {
     int gdo2_val;
 
     struct workqueue_struct * queue;
-    struct work_struct * reset;
+};
+
+
+struct cc1101_work {
+    struct work_struct work;
+    struct cc1101_data * data;
 };
 
 
@@ -125,14 +130,15 @@ static irqreturn_t gdo2_interrupt_handler(int i, void * irq_data)
 }
 
 
-static void cc1101_reset_configure(void * dev_data)
+static void cc1101_reset_configure(struct work_struct * work_ptr)
 {
-    struct cc1101_data * data = (struct cc1101_data *)dev_data;
+    struct cc1101_work * wrk = container_of(work_ptr, struct cc1101_work, work);
 
     printk(KERN_INFO "CC1101 module resets chipcon\n");
     // TODO: lock SPI module
     // TODO: reset CC1101
     // TODO: unlock SPI module
+    kfree(wrk);
     printk(KERN_INFO "CC1101 successfully reset chipcon\n");
 }
 
@@ -144,10 +150,11 @@ int cc1101_probe(struct spi_device * spi)
     int result;
     unsigned long flags;
     struct cc1101_data * spi_data;
+    struct cc1101_work * reset_work;
 
     result = 0;
 
-    printk(KERN_INFO "CC1101 driver probe\n");
+    printk(KERN_INFO "CC1101 spi driver probe\n");
 
     // setup data
     spi_data = kzalloc(sizeof(*spi_data), GFP_KERNEL);
@@ -160,23 +167,25 @@ int cc1101_probe(struct spi_device * spi)
     spi_data->gdo0_pin = GDO0_pin;
     spi_data->gdo2_pin = GDO2_pin;
 
-    spin_lock_init(spi_data->spi_lock);
+    spin_lock_init(&spi_data->spi_lock);
     spin_lock_irqsave(&(spi_data->spi_lock), flags);
 
     // create work queue
     spi_data->queue = create_singlethread_workqueue("CC1101-queue");
     if (IS_ERR(spi_data->queue)) {
         printk(KERN_ERR "CC1101 module could not allocate memory for queue\n");
-	result = -ENOMEM;
-	goto cc1101_probe_free_spi_lock;
+        result = -ENOMEM;
+        goto cc1101_probe_free_spi_lock;
     }
 
     // setup reset work
-    spi_data->reset = kzalloc(sizeof(*(spi_data->reset)), GFP_KERNEL);
-    if (IS_ERR(spi_data->reset)) {
+    reset_work = kzalloc(sizeof(struct cc1101_work), GFP_KERNEL);
+    if (IS_ERR(reset_work)) {
         printk(KERN_ERR "CC1101 module could not allocate memory for reset work\n");
-	goto cc1101_probe_free_queue;
+        goto cc1101_probe_free_queue;
     }
+    INIT_WORK(&reset_work->work, cc1101_reset_configure);
+    reset_work->data = spi_data;
 
     // setup GDO0
     if (!gpio_is_valid(spi_data->gdo0_pin)) {
@@ -243,14 +252,16 @@ int cc1101_probe(struct spi_device * spi)
     // setup the rest of the struct
     spi_set_drvdata(spi, spi_data);
 
-    status = queue_work(spi_data->queue, spi_data->reset);
+    status = queue_work(spi_data->queue, &(reset_work->work));
     if (!status) {
         printk(KERN_ERR "CC1101 could not schedule reset work\n");
-	result = -EINVAL;
-	goto cc1101_probe_free_gdo2_irq;
+        result = -EINVAL;
+        goto cc1101_probe_free_gdo2_irq;
     }
 
-    spin_unlock_irqsave(spi_data->spi_lock, flags);
+    spin_unlock_irqrestore(&spi_data->spi_lock, flags);
+
+    printk(KERN_INFO "CC1101 spi driver finished probing\n");
 
     return 0;
 
@@ -267,15 +278,14 @@ cc1101_probe_free_gdo0:
     gpio_free(spi_data->gdo2_pin);
 
 cc1101_probe_free_reset_work:
-    kfree(spi_data->reset);
+    kfree(reset_work);
 
 cc1101_probe_free_queue:
     destroy_workqueue(spi_data->queue);
 
 cc1101_probe_free_spi_lock:
-    spin_unlock_irqsave(&(spi_data->spi_lock), flags);
-
-cc1101_probe_free_data:
+    spin_unlock_irqrestore(&spi_data->spi_lock, flags);
+// cc1101_probe_free_data:
     kfree(spi_data);
 
 cc1101_probe_exit:
@@ -294,7 +304,6 @@ int cc1101_remove(struct spi_device * spi)
     data = spi_get_drvdata(spi);
 
     flush_workqueue(data->queue);
-    kfree(data->reset);
     destroy_workqueue(data->queue);
 
     free_irq(data->gdo0_irq, data);
