@@ -135,9 +135,11 @@ static void cc1101_reset_configure(struct work_struct * work_ptr)
     struct cc1101_work * wrk = container_of(work_ptr, struct cc1101_work, work);
 
     printk(KERN_INFO "CC1101 module resets chipcon\n");
-    // TODO: lock SPI module
+
+    spin_lock(wrk->data->spi_lock);
     // TODO: reset CC1101
-    // TODO: unlock SPI module
+    spin_unlock(wrk->data->spi_lock);
+
     kfree(wrk);
     printk(KERN_INFO "CC1101 successfully reset chipcon\n");
 }
@@ -167,15 +169,12 @@ int cc1101_probe(struct spi_device * spi)
     spi_data->gdo0_pin = GDO0_pin;
     spi_data->gdo2_pin = GDO2_pin;
 
-    spin_lock_init(&spi_data->spi_lock);
-    spin_lock_irqsave(&(spi_data->spi_lock), flags);
-
     // create work queue
     spi_data->queue = create_singlethread_workqueue("CC1101-queue");
     if (IS_ERR(spi_data->queue)) {
         printk(KERN_ERR "CC1101 module could not allocate memory for queue\n");
         result = -ENOMEM;
-        goto cc1101_probe_free_spi_lock;
+        goto cc1101_probe_free_data;
     }
 
     // setup reset work
@@ -187,18 +186,22 @@ int cc1101_probe(struct spi_device * spi)
     INIT_WORK(&reset_work->work, cc1101_reset_configure);
     reset_work->data = spi_data;
 
+    // disable interrupts while setuping IRQ handlers
+    spin_lock_init(&spi_data->spi_lock);
+    spin_lock_irqsave(&(spi_data->spi_lock), flags);
+
     // setup GDO0
     if (!gpio_is_valid(spi_data->gdo0_pin)) {
         printk(KERN_ERR "CC1101 GDO0 pin %d is invalid\n", spi_data->gdo0_pin);
         result = -EINVAL;
-        goto cc1101_probe_free_reset_work;
+        goto cc1101_probe_free_spin_lock;
     }
 
     status = gpio_request_one(spi_data->gdo0_pin, GPIOF_DIR_IN, GDO0_name);
-    if (!status) {
+    if (status) {
         printk(KERN_ERR "CC1101 could not acquire GDO0. Reason: %d\n", status);
         result = -EBUSY;
-        goto cc1101_probe_free_reset_work;
+        goto cc1101_probe_free_spin_lock;
     }
 
     spi_data->gdo0_val = gpio_get_value(spi_data->gdo0_pin);
@@ -212,7 +215,7 @@ int cc1101_probe(struct spi_device * spi)
     spi_data->gdo0_irq = irq_num;
 
     status = request_irq(spi_data->gdo0_irq, gdo0_interrupt_handler, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, GDO0_IRQ_NAME, spi_data);
-    if (status != 0) {
+    if (status) {
         printk(KERN_ERR "CC1101 GDO0 failed to request irq. Reason: %d\n", status);
         result = -EBUSY;
         goto cc1101_probe_free_gdo0;
@@ -226,7 +229,7 @@ int cc1101_probe(struct spi_device * spi)
     }
 
     status = gpio_request_one(spi_data->gdo2_pin, GPIOF_DIR_IN, GDO2_name);
-    if (status != 0) {
+    if (status) {
         printk(KERN_ERR "CC1101 could not acquire GDO2. Reason: %d\n", status);
         result = -EBUSY;
         goto cc1101_probe_free_gdo0_irq;
@@ -243,7 +246,7 @@ int cc1101_probe(struct spi_device * spi)
     spi_data->gdo2_irq = irq_num;
 
     status = request_irq(irq_num, gdo2_interrupt_handler, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, GDO2_IRQ_NAME, spi_data);
-    if (status != 0) {
+    if (status) {
         printk(KERN_ERR "CC1101 GDO2 failed to request irq. Reason: %d\n", status);
         result = -EBUSY;
         goto cc1101_probe_free_gdo2;
@@ -251,6 +254,9 @@ int cc1101_probe(struct spi_device * spi)
 
     // setup the rest of the struct
     spi_set_drvdata(spi, spi_data);
+    spin_unlock_irqrestore(&spi_data->spi_lock, flags);
+
+    printk(KERN_INFO "CC1101 schedules reset-config work\n");
 
     status = queue_work(spi_data->queue, &(reset_work->work));
     if (!status) {
@@ -258,8 +264,6 @@ int cc1101_probe(struct spi_device * spi)
         result = -EINVAL;
         goto cc1101_probe_free_gdo2_irq;
     }
-
-    spin_unlock_irqrestore(&spi_data->spi_lock, flags);
 
     printk(KERN_INFO "CC1101 spi driver finished probing\n");
 
@@ -277,15 +281,16 @@ cc1101_probe_free_gdo0_irq:
 cc1101_probe_free_gdo0:
     gpio_free(spi_data->gdo2_pin);
 
+cc1101_probe_free_spin_lock:
+    spin_unlock_irqrestore(&spi_data->spi_lock, flags);
+
 cc1101_probe_free_reset_work:
     kfree(reset_work);
 
 cc1101_probe_free_queue:
     destroy_workqueue(spi_data->queue);
 
-cc1101_probe_free_spi_lock:
-    spin_unlock_irqrestore(&spi_data->spi_lock, flags);
-// cc1101_probe_free_data:
+cc1101_probe_free_data:
     kfree(spi_data);
 
 cc1101_probe_exit:
@@ -295,27 +300,31 @@ cc1101_probe_exit:
 
 int cc1101_remove(struct spi_device * spi)
 {
+    // TODO: there is a chance of memory leak because of reset_work
     struct cc1101_data  * data;
+    unsigned long flags;
 
-    printk(KERN_INFO "CC1101 module de-initialization\n");
-
-    // TODO: i need to make sure that all transfer operations have finished before free the structure
+    printk(KERN_INFO "CC1101 driver removing in progress\n");
 
     data = spi_get_drvdata(spi);
 
     flush_workqueue(data->queue);
     destroy_workqueue(data->queue);
 
+    spin_lock_irqsave(&data->spi_lock, flags);
     free_irq(data->gdo0_irq, data);
     free_irq(data->gdo2_irq, data);
 
     gpio_free(data->gdo0_pin);
     gpio_free(data->gdo2_pin);
 
+    data->spi = NULL;
     spi_set_drvdata(spi, NULL);
 
+    spin_unlock_irqrestore(&data->spi_lock, flags);
     kfree(data);
 
+    printk(KERN_INFO "CC1101 driver has been removed\n");
     return 0;
 }
 
@@ -325,7 +334,7 @@ static int __init cc1101_module_init(void)
     int status;
     struct spi_master *master;
 
-    printk(KERN_INFO "CC1101M module initialization in progress\n");
+    printk(KERN_INFO "CC1101 module initialization in progress\n");
 
     master = spi_busnum_to_master(SPI_BUS_MASTER);
     if (!master) {
@@ -338,8 +347,6 @@ static int __init cc1101_module_init(void)
         printk(KERN_ERR "Could not add hotplug SPI device\n");
         return -EINVAL;
     }
-
-    printk(KERN_INFO "Module CC1101M added hotplug spi device. About to register cc1101m spi driver\n");
 
     status = spi_register_driver(&cc1101_driver);
     if (status < 0) {
@@ -357,13 +364,13 @@ static int __init cc1101_module_init(void)
 
 static void __exit cc1101_module_exit(void)
 {
-    printk(KERN_INFO "About to deinitialize CC1101M module\n");
+    printk(KERN_INFO "CC1101 module deinitialization\n");
 
     spi_unregister_driver(&cc1101_driver);
     spi_unregister_device(cc1101_spi_device);
     cc1101_spi_device = NULL;
 
-    printk(KERN_INFO "CC1101M module has been deinitialized\n");
+    printk(KERN_INFO "CC1101 module has been deinitialized\n");
 }
 
 
