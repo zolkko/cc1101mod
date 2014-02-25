@@ -15,6 +15,12 @@
 #include <linux/workqueue.h>
 #include <linux/err.h>
 #include <linux/mutex.h>
+#include <linux/delay.h>
+
+#include <linux/string.h>
+
+#include "cc1101.h"
+#include "cc1101m.h"
 
 
 // TODO: pass SPI_BUS_MASTER, SPI_CHIP_SELECT, GDO0_pin and GDO2_pin as parameters to the module
@@ -23,6 +29,7 @@
 #define CC1101_MNAME    "cc1101m"
 #define SPI_BUS_MASTER  0
 #define SPI_CHIP_SELECT 0
+#define SPI_MAX_SPEED   9000000
 
 
 #define GDO0_pin  22
@@ -32,9 +39,19 @@
 #define GDO2_pin  23
 #define GDO2_name "GDO2"
 
+#define GDO1_pin  9
+#define GDO1_name "GDO1"
+#define SO_pin    GDO1_pin
+
+#define CS_pin    8    
+#define CS_name   "ChipSelect"
+
 
 #define GDO0_IRQ_NAME "GDO0 interrupt handler"
 #define GDO2_IRQ_NAME "GDO2 interrupt handler"
+
+
+#define CC1101_WORK_BUF_LEN 128
 
 
 static int cc1101_remove(struct spi_device * spi);
@@ -43,7 +60,7 @@ static int cc1101_probe(struct spi_device * spi);
 
 static struct spi_board_info cc1101_hotplug_spi_device = {
     .modalias = CC1101_MNAME,
-    .max_speed_hz = 50000,
+    .max_speed_hz = SPI_MAX_SPEED,
     .bus_num = SPI_BUS_MASTER,
     .chip_select = SPI_CHIP_SELECT,
     .mode = SPI_MODE_0
@@ -80,9 +97,12 @@ struct cc1101_data {
     struct spi_device * spi;
 
     spinlock_t spi_lock;
+    struct mutex buffer_mutex;
 
     int gdo0_pin;
+    int gdo1_pin;
     int gdo2_pin;
+    int cs_pin;
 
     int gdo0_irq;
     int gdo2_irq;
@@ -91,6 +111,8 @@ struct cc1101_data {
     int gdo2_val;
 
     struct workqueue_struct * queue;
+
+    u8 buf[CC1101_WORK_BUF_LEN];
 };
 
 
@@ -105,9 +127,11 @@ static irqreturn_t gdo0_interrupt_handler(int i, void * irq_data)
     struct cc1101_data * data = (struct cc1101_data *)irq_data;
     int value = gpio_get_value(data->gdo0_pin);
 
+    printk(KERN_INFO "cc1101: gdo0 interrupt handler, value = %d\n", value);
+
     if (value != data->gdo0_val) {
         data->gdo0_val = value;
-        printk(KERN_INFO "CC1101 GDO0 interrupt handler value: %d\n", value);
+        printk(KERN_INFO "cc1101: gdo0 interrupt handler value: %d\n", value);
         return IRQ_HANDLED;
     } else {
         return IRQ_NONE;
@@ -120,6 +144,8 @@ static irqreturn_t gdo2_interrupt_handler(int i, void * irq_data)
     struct cc1101_data * data = (struct cc1101_data *)irq_data;
     int value = gpio_get_value(data->gdo2_pin);
 
+    printk(KERN_INFO "cc1101: gdo2 interrupt handler, value = %d\n", value);
+
     if (value != data->gdo2_val) {
         data->gdo2_val = value;
         printk(KERN_INFO "CC1101 GDO2 interrupt handler value: %d\n", value);
@@ -130,18 +156,135 @@ static irqreturn_t gdo2_interrupt_handler(int i, void * irq_data)
 }
 
 
+static inline void cc1101_chip_select(struct cc1101_data * self)
+{
+    gpio_set_value(self->cs_pin, 0);
+}
+
+
+static inline void cc1101_chip_release(struct cc1101_data * self)
+{
+    gpio_set_value(self->cs_pin, 1);
+}
+
+
+static inline bool cc1101_ready(struct cc1101_data * self)
+{
+    return gpio_get_value(self->gdo1_pin) == 0;
+}
+
+
+static inline int cc1101_burst_write(struct cc1101_data * self, u8 addr, const u8 * data, int len)
+{
+    int result;
+    struct spi_message msg;
+    struct spi_transfer xfer = {
+        .len = len + 1,
+        .tx_buf = self->buf,
+        .rx_buf = self->buf,
+    };
+
+    if (len + 1 > CC1101_WORK_BUF_LEN) {
+        printk(KERN_ERR "cc1101: could not burst write. %d too much data to send\n", len + 1);
+        return 0;
+    }
+
+    spi_message_init(&msg);
+    spi_message_add_tail(&xfer, &msg);
+
+    mutex_lock(&self->buffer_mutex);
+    self->buf[0] = addr | CC1101_BURST_BIT_bm;
+    memcpy(&self->buf[1], data, len);
+
+    result = spi_sync(self->spi, &msg);
+    if (result)
+        printk(KERN_ERR "cc1101: burst write failed for address 0x%hhx\n", addr);
+    mutex_unlock(&self->buffer_mutex);
+
+    return result;
+}
+
+static inline int cc1101_write(struct cc1101_data * self, u8 addr, u8 data)
+{
+    int result;
+    struct spi_message msg;
+    struct spi_transfer xfer = {
+        .len = 2,
+        .tx_buf = self->buf,
+        .rx_buf = self->buf,
+    };
+
+    spi_message_init(&msg);
+    spi_message_add_tail(&xfer, &msg);
+
+    mutex_lock(&self->buffer_mutex);
+    self->buf[0] = addr;
+    self->buf[1] = data;
+
+    result = spi_sync(self->spi, &msg);
+    if (result)
+        printk(KERN_ERR "cc1101: write failed for address 0x%hhx\n", addr);
+    mutex_unlock(&self->buffer_mutex);
+
+    return result;
+}
+
+
+static inline int cc1101_strobe(struct cc1101_data * self, u8 addr)
+{
+    int result;
+    struct spi_message msg;
+    struct spi_transfer xfer = {
+        .len = 1,
+        .tx_buf = self->buf,
+        .rx_buf = self->buf,
+    };
+
+    spi_message_init(&msg);
+    spi_message_add_tail(&xfer, &msg);
+
+    mutex_lock(&self->buffer_mutex);
+    self->buf[0] = addr;
+
+    result = spi_sync(self->spi, &msg);
+    if (result)
+        printk(KERN_ERR "cc1101: strobe failed for address 0x%hhx\n", addr);
+    mutex_unlock(&self->buffer_mutex);
+
+    return result;
+}
+
+
 static void cc1101_reset_configure(struct work_struct * work_ptr)
 {
+    unsigned short i;
     struct cc1101_work * wrk = container_of(work_ptr, struct cc1101_work, work);
 
-    printk(KERN_INFO "CC1101 module resets chipcon\n");
+    printk(KERN_INFO "cc1101: module resets chipcon\n");
 
-    spin_lock(wrk->data->spi_lock);
-    // TODO: reset CC1101
-    spin_unlock(wrk->data->spi_lock);
+    cc1101_chip_select(wrk->data);
+    udelay(1);
+    cc1101_chip_release(wrk->data);
+    udelay(50);
+
+    for (i = 0; i < 0xffff && cc1101_ready(wrk->data); i++) ;
+
+    cc1101_chip_select(wrk->data);
+    for (i = 0; i < 0xffff && !cc1101_ready(wrk->data); i++) ;
+
+    cc1101_strobe(wrk->data, CCx_SRES);
+
+    for (i = 0; i < 0xffff && !cc1101_ready(wrk->data); i++) ;
+    cc1101_chip_release(wrk->data);
+
+    // configure cc1101 chip
+    cc1101_burst_write(wrk->data, CCx_REG_BEGIN, cc1101_cfg, sizeof(cc1101_cfg));
+
+    printk(KERN_INFO "cc1101: configuration has been written to SPI interface\n");
 
     kfree(wrk);
-    printk(KERN_INFO "CC1101 successfully reset chipcon\n");
+
+    printk(KERN_INFO "cc1101: successfully reset chipcon\n");
 }
 
 
@@ -167,7 +310,9 @@ int cc1101_probe(struct spi_device * spi)
     }
     spi_data->spi = spi;
     spi_data->gdo0_pin = GDO0_pin;
+    spi_data->gdo1_pin = GDO1_pin;
     spi_data->gdo2_pin = GDO2_pin;
+    spi_data->cs_pin   = CS_pin;
 
     // create work queue
     spi_data->queue = create_singlethread_workqueue("CC1101-queue");
@@ -185,6 +330,9 @@ int cc1101_probe(struct spi_device * spi)
     }
     INIT_WORK(&reset_work->work, cc1101_reset_configure);
     reset_work->data = spi_data;
+
+    // initialize mutex
+    mutex_init(&spi_data->buffer_mutex);
 
     // disable interrupts while setuping IRQ handlers
     spin_lock_init(&spi_data->spi_lock);
@@ -221,18 +369,32 @@ int cc1101_probe(struct spi_device * spi)
         goto cc1101_probe_free_gdo0;
     }
 
+    // setup GDO1
+    if (!gpio_is_valid(spi_data->gdo1_pin)) {
+        printk(KERN_ERR "cc1101: GDO1 pin %d is invalid\n", spi_data->gdo1_pin);
+        result = -EINVAL;
+        goto cc1101_probe_free_gdo0_irq;
+    }
+
+    status = gpio_request_one(spi_data->gdo1_pin, GPIOF_DIR_IN, GDO1_name);
+    if (status) {
+        printk(KERN_ERR "cc1101: could not acquire GDO1 pin. Status: %d\n", status);
+        result = -EBUSY;
+        goto cc1101_probe_free_gdo0_irq;
+    }
+
     // setup GDO2
     if (!gpio_is_valid(spi_data->gdo2_pin)) {
         printk(KERN_ERR "CC1101 GDO2 pin %d is invalid\n", spi_data->gdo2_pin);
         result = -EINVAL;
-        goto cc1101_probe_free_gdo0_irq;
+        goto cc1101_probe_free_gdo1;
     }
 
     status = gpio_request_one(spi_data->gdo2_pin, GPIOF_DIR_IN, GDO2_name);
     if (status) {
         printk(KERN_ERR "CC1101 could not acquire GDO2. Reason: %d\n", status);
         result = -EBUSY;
-        goto cc1101_probe_free_gdo0_irq;
+        goto cc1101_probe_free_gdo1;
     }
 
     spi_data->gdo2_val = gpio_get_value(spi_data->gdo2_pin);
@@ -252,6 +414,28 @@ int cc1101_probe(struct spi_device * spi)
         goto cc1101_probe_free_gdo2;
     }
 
+    spi->max_speed_hz = SPI_MAX_SPEED;
+    status = spi_setup(spi);
+    if (status < 0) {
+        printk(KERN_ERR "cc1101: cannot setup spi device. Status: %d\n", status);
+        result = -EINVAL;
+        goto cc1101_probe_free_gdo2;
+    }
+
+    // setup CS pin
+    if (!gpio_is_valid(spi_data->cs_pin)) {
+        printk(KERN_ERR "cc1101: Chip select pin %d is invalid\n", spi_data->cs_pin);
+        result = -EINVAL;
+        goto cc1101_probe_free_gdo2_irq;
+    }
+
+    status = gpio_request_one(spi_data->cs_pin, GPIOF_OUT_INIT_HIGH, CS_name);
+    if (status) {
+        printk(KERN_ERR "cc1101: could not acquire Chip select. Reason: %d\n", status);
+        result = -EBUSY;
+        goto cc1101_probe_free_gdo2_irq;
+    }
+
     // setup the rest of the struct
     spi_set_drvdata(spi, spi_data);
     spin_unlock_irqrestore(&spi_data->spi_lock, flags);
@@ -262,18 +446,24 @@ int cc1101_probe(struct spi_device * spi)
     if (!status) {
         printk(KERN_ERR "CC1101 could not schedule reset work\n");
         result = -EINVAL;
-        goto cc1101_probe_free_gdo2_irq;
+        goto cc1101_probe_free_cs;
     }
 
     printk(KERN_INFO "CC1101 spi driver finished probing\n");
 
     return 0;
 
+cc1101_probe_free_cs:
+    gpio_free(spi_data->cs_pin);
+
 cc1101_probe_free_gdo2_irq:
     free_irq(spi_data->gdo2_irq, spi_data);
 
 cc1101_probe_free_gdo2:
     gpio_free(spi_data->gdo2_pin);
+
+cc1101_probe_free_gdo1:
+    gpio_free(spi_data->gdo1_pin);
 
 cc1101_probe_free_gdo0_irq:
     free_irq(spi_data->gdo0_irq, spi_data);
@@ -284,7 +474,7 @@ cc1101_probe_free_gdo0:
 cc1101_probe_free_spin_lock:
     spin_unlock_irqrestore(&spi_data->spi_lock, flags);
 
-cc1101_probe_free_reset_work:
+// cc1101_probe_free_reset_work:
     kfree(reset_work);
 
 cc1101_probe_free_queue:
@@ -316,7 +506,9 @@ int cc1101_remove(struct spi_device * spi)
     free_irq(data->gdo2_irq, data);
 
     gpio_free(data->gdo0_pin);
+    gpio_free(data->gdo1_pin);
     gpio_free(data->gdo2_pin);
+    gpio_free(data->cs_pin);
 
     data->spi = NULL;
     spi_set_drvdata(spi, NULL);
