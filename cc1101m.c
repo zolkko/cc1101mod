@@ -29,7 +29,12 @@
 #define CC1101_MNAME    "cc1101m"
 #define SPI_BUS_MASTER  0
 #define SPI_CHIP_SELECT 0
-#define SPI_MAX_SPEED   9000000
+#define SPI_MAX_SPEED   50000000
+
+
+#define SPI_SPEED_HZ      2000000
+#define SPI_BITS_PER_WORD 8
+#define SPI_DELAY_USECS   0
 
 
 #define GDO0_pin  22
@@ -43,16 +48,12 @@
 #define GDO1_name "GDO1"
 #define SO_pin    GDO1_pin
 
-#define CS_pin    8    
-#define CS_name   "ChipSelect"
-
 
 #define GDO0_IRQ_NAME "GDO0 interrupt handler"
 #define GDO2_IRQ_NAME "GDO2 interrupt handler"
 
 
 #define CC1101_WORK_BUF_LEN 128
-
 
 static int cc1101_remove(struct spi_device * spi);
 static int cc1101_probe(struct spi_device * spi);
@@ -102,7 +103,6 @@ struct cc1101_data {
     int gdo0_pin;
     int gdo1_pin;
     int gdo2_pin;
-    int cs_pin;
 
     int gdo0_irq;
     int gdo2_irq;
@@ -156,18 +156,6 @@ static irqreturn_t gdo2_interrupt_handler(int i, void * irq_data)
 }
 
 
-static inline void cc1101_chip_select(struct cc1101_data * self)
-{
-    gpio_set_value(self->cs_pin, 0);
-}
-
-
-static inline void cc1101_chip_release(struct cc1101_data * self)
-{
-    gpio_set_value(self->cs_pin, 1);
-}
-
-
 static inline bool cc1101_ready(struct cc1101_data * self)
 {
     return gpio_get_value(self->gdo1_pin) == 0;
@@ -182,6 +170,9 @@ static inline int cc1101_burst_write(struct cc1101_data * self, u8 addr, const u
         .len = len + 1,
         .tx_buf = self->buf,
         .rx_buf = self->buf,
+        .speed_hz = SPI_SPEED_HZ,
+        .bits_per_word = SPI_BITS_PER_WORD,
+        .delay_usecs = SPI_DELAY_USECS
     };
 
     if (len + 1 > CC1101_WORK_BUF_LEN) {
@@ -194,6 +185,7 @@ static inline int cc1101_burst_write(struct cc1101_data * self, u8 addr, const u
 
     mutex_lock(&self->buffer_mutex);
     self->buf[0] = addr | CC1101_BURST_BIT_bm;
+
     memcpy(&self->buf[1], data, len);
 
     result = spi_sync(self->spi, &msg);
@@ -212,6 +204,9 @@ static inline int cc1101_write(struct cc1101_data * self, u8 addr, u8 data)
         .len = 2,
         .tx_buf = self->buf,
         .rx_buf = self->buf,
+        .speed_hz = SPI_SPEED_HZ,
+        .bits_per_word = SPI_BITS_PER_WORD,
+        .delay_usecs = SPI_DELAY_USECS
     };
 
     spi_message_init(&msg);
@@ -238,6 +233,9 @@ static inline int cc1101_strobe(struct cc1101_data * self, u8 addr)
         .len = 1,
         .tx_buf = self->buf,
         .rx_buf = self->buf,
+        .speed_hz = SPI_SPEED_HZ,
+        .bits_per_word = SPI_BITS_PER_WORD,
+        .delay_usecs = SPI_DELAY_USECS
     };
 
     spi_message_init(&msg);
@@ -257,25 +255,15 @@ static inline int cc1101_strobe(struct cc1101_data * self, u8 addr)
 
 static void cc1101_reset_configure(struct work_struct * work_ptr)
 {
-    unsigned short i;
     struct cc1101_work * wrk = container_of(work_ptr, struct cc1101_work, work);
 
     printk(KERN_INFO "cc1101: module resets chipcon\n");
 
-    cc1101_chip_select(wrk->data);
-    udelay(1);
-    cc1101_chip_release(wrk->data);
-    udelay(50);
-
-    for (i = 0; i < 0xffff && cc1101_ready(wrk->data); i++) ;
-
-    cc1101_chip_select(wrk->data);
-    for (i = 0; i < 0xffff && !cc1101_ready(wrk->data); i++) ;
-
+    // send reset strobe
     cc1101_strobe(wrk->data, CCx_SRES);
 
-    for (i = 0; i < 0xffff && !cc1101_ready(wrk->data); i++) ;
-    cc1101_chip_release(wrk->data);
+    // wait for PLL to stabilze
+    msleep(200);
 
     // configure cc1101 chip
     cc1101_burst_write(wrk->data, CCx_REG_BEGIN, cc1101_cfg, sizeof(cc1101_cfg));
@@ -299,20 +287,22 @@ int cc1101_probe(struct spi_device * spi)
 
     result = 0;
 
-    printk(KERN_INFO "CC1101 spi driver probe\n");
+    printk(KERN_INFO "cc1101: spi driver probe\n");
 
     // setup data
     spi_data = kzalloc(sizeof(*spi_data), GFP_KERNEL);
     if (IS_ERR(spi_data)) {
-        printk(KERN_ERR "CC1101 module could not allocate memory\n");
+        printk(KERN_ERR "cc1101: module could not allocate memory\n");
         result = -ENOMEM;
         goto cc1101_probe_exit;
+    }
+    else {
+        printk(KERN_INFO "cc1101: spi_data size %d\n", sizeof(*spi_data));
     }
     spi_data->spi = spi;
     spi_data->gdo0_pin = GDO0_pin;
     spi_data->gdo1_pin = GDO1_pin;
     spi_data->gdo2_pin = GDO2_pin;
-    spi_data->cs_pin   = CS_pin;
 
     // create work queue
     spi_data->queue = create_singlethread_workqueue("CC1101-queue");
@@ -422,20 +412,6 @@ int cc1101_probe(struct spi_device * spi)
         goto cc1101_probe_free_gdo2;
     }
 
-    // setup CS pin
-    if (!gpio_is_valid(spi_data->cs_pin)) {
-        printk(KERN_ERR "cc1101: Chip select pin %d is invalid\n", spi_data->cs_pin);
-        result = -EINVAL;
-        goto cc1101_probe_free_gdo2_irq;
-    }
-
-    status = gpio_request_one(spi_data->cs_pin, GPIOF_OUT_INIT_HIGH, CS_name);
-    if (status) {
-        printk(KERN_ERR "cc1101: could not acquire Chip select. Reason: %d\n", status);
-        result = -EBUSY;
-        goto cc1101_probe_free_gdo2_irq;
-    }
-
     // setup the rest of the struct
     spi_set_drvdata(spi, spi_data);
     spin_unlock_irqrestore(&spi_data->spi_lock, flags);
@@ -446,15 +422,12 @@ int cc1101_probe(struct spi_device * spi)
     if (!status) {
         printk(KERN_ERR "CC1101 could not schedule reset work\n");
         result = -EINVAL;
-        goto cc1101_probe_free_cs;
+        goto cc1101_probe_free_gdo2_irq;
     }
 
     printk(KERN_INFO "CC1101 spi driver finished probing\n");
 
     return 0;
-
-cc1101_probe_free_cs:
-    gpio_free(spi_data->cs_pin);
 
 cc1101_probe_free_gdo2_irq:
     free_irq(spi_data->gdo2_irq, spi_data);
@@ -508,7 +481,6 @@ int cc1101_remove(struct spi_device * spi)
     gpio_free(data->gdo0_pin);
     gpio_free(data->gdo1_pin);
     gpio_free(data->gdo2_pin);
-    gpio_free(data->cs_pin);
 
     data->spi = NULL;
     spi_set_drvdata(spi, NULL);
