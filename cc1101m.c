@@ -255,15 +255,31 @@ static inline int cc1101_strobe(struct cc1101_data * self, u8 addr)
 
 static void cc1101_reset_configure(struct work_struct * work_ptr)
 {
+    u8 i;
+    u8 status;
     struct cc1101_work * wrk = container_of(work_ptr, struct cc1101_work, work);
 
     printk(KERN_INFO "cc1101: module resets chipcon\n");
 
     // send reset strobe
     cc1101_strobe(wrk->data, CCx_SRES);
+    mutex_lock(&wrk->data->buffer_mutex);
+    status = wrk->data->buf[0];
+    mutex_unlock(&wrk->data->buffer_mutex);
 
-    // wait for PLL to stabilze
-    msleep(200);
+    // wait for chip ready
+    for (i = 0; i < 0xff && (status & CC1101_STATUS_CHIP_RDYn_bm); i++) {
+        msleep(50);
+
+        cc1101_strobe(wrk->data, CCx_SNOP);
+        mutex_lock(&wrk->data->buffer_mutex);
+        status = wrk->data->buf[0];
+        mutex_unlock(&wrk->data->buffer_mutex);
+    }
+
+    if (status & CC1101_STATUS_CHIP_RDYn_bm) {
+        printk(KERN_ERR "cc1101: chip is not ready. Status: 0x%x\n", status);
+    }
 
     // configure cc1101 chip
     cc1101_burst_write(wrk->data, CCx_REG_BEGIN, cc1101_cfg, sizeof(cc1101_cfg));
@@ -296,9 +312,7 @@ int cc1101_probe(struct spi_device * spi)
         result = -ENOMEM;
         goto cc1101_probe_exit;
     }
-    else {
-        printk(KERN_INFO "cc1101: spi_data size %d\n", sizeof(*spi_data));
-    }
+
     spi_data->spi = spi;
     spi_data->gdo0_pin = GDO0_pin;
     spi_data->gdo1_pin = GDO1_pin;
